@@ -1,85 +1,76 @@
 // src/utils/firebase.ts
 
-// This file sets up Firebase, including initialization and user authentication, 
-// using the global variables provided by the Canvas environment for security and configuration.
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc } from 'firebase/firestore';
 
-import { initializeApp, FirebaseApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, Auth, User } from 'firebase/auth';
-import { getFirestore, Firestore, collection, CollectionReference, DocumentData } from 'firebase/firestore';
-
-// --- Global Variables (Mandatory for Canvas Environment) ---
-// These variables are provided by the hosting environment at runtime.
-declare const __app_id: string;
-declare const __firebase_config: string;
+// Global access to the environment variables set by the platform
+// These declarations are needed for TypeScript to recognize the global variables
+declare const __firebase_config: string | undefined;
 declare const __initial_auth_token: string | undefined;
+declare const __app_id: string | undefined;
 
-// --- Private Instances ---
-let app: FirebaseApp | null = null;
-let auth: Auth | null = null;
-let db: Firestore | null = null;
-let currentUserId: string | null = null;
-let isInitialized = false;
+let app: any;
+let db: any;
+let auth: any;
+let userId: string | undefined;
 
 /**
- * Initializes Firebase, authenticates the user, and sets up Firestore.
- * This should only be called once.
- * @returns An object containing the Firebase services and the user's ID.
+ * Initializes Firebase App, performs user authentication, and sets up Firestore.
+ * Includes robust checks for local development environment where global variables are undefined.
  */
 export async function initializeFirebase() {
-    if (isInitialized) {
-        return { 
-            db: db as Firestore, 
-            auth: auth as Auth, 
-            userId: currentUserId as string 
-        };
+    if (app) {
+        return { db, userId: userId || 'anonymous' };
     }
 
     try {
         // 1. Configuration Setup
+        // Use global variables if they exist, otherwise provide safe fallbacks
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = JSON.parse(__firebase_config);
+
+        // Check for existence before accessing; fall back to an empty string for JSON.parse safety
+        const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        const firebaseConfig = JSON.parse(configString);
 
         // 2. Initialize Firebase Services
         app = initializeApp(firebaseConfig);
         db = getFirestore(app);
         auth = getAuth(app);
 
-        // 3. Authentication
-        // Use the custom token if provided (authenticated user), otherwise sign in anonymously.
-        let user: User;
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            const userCredential = await signInWithCustomToken(auth, __initial_auth_token);
-            user = userCredential.user;
+        // 3. Authenticate User
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : undefined;
+
+        if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
         } else {
-            const userCredential = await signInAnonymously(auth);
-            user = userCredential.user;
+            // Sign in anonymously for local testing/unauthenticated users
+            await signInAnonymously(auth);
         }
-        
-        currentUserId = user.uid || crypto.randomUUID();
-        isInitialized = true;
 
-        console.log(`Firebase initialized. User ID: ${currentUserId.substring(0, 8)}... App ID: ${appId}`);
-        
-        return { db: db as Firestore, auth: auth as Auth, userId: currentUserId as string, appId };
+        // 4. Set the authenticated user ID
+        userId = auth.currentUser?.uid || crypto.randomUUID();
 
+        return { db, userId: userId as string };
     } catch (error) {
-        console.error("Failed to initialize Firebase or authenticate:", error);
-        // Fallback to a random ID if auth fails, although subsequent DB operations will fail.
-        currentUserId = currentUserId || crypto.randomUUID(); 
-        isInitialized = true; // Mark as initialized to prevent redundant calls on failure
-        
-        // Throw or return null/defaults depending on error recovery strategy
-        throw new Error("Firebase initialization failed.");
+        console.error("Firebase initialization failed. The app will run in local-only mode.", error);
+        // Fallback to a mock environment if Firebase fails to initialize
+        userId = 'anonymous_local';
+        return { db: null, userId: userId as string };
     }
 }
 
 /**
- * Gets the CollectionReference for the public drawing data.
- * @param db The Firestore instance.
- * @param appId The unique application ID.
- * @returns A CollectionReference pointing to the shared drawing collection.
+ * Gets the Firestore collection reference for the collaborative whiteboard drawings.
+ * Data is stored publicly under /artifacts/{appId}/public/data/drawings
  */
-export function getDrawingCollection(db: Firestore, appId: string): CollectionReference<DocumentData> {
+export function getDrawingCollection(db: any, appId: string) {
+    if (!db) return null;
+
     // MANDATORY PUBLIC DATA PATH: /artifacts/{appId}/public/data/drawings
-    return collection(db, 'artifacts', appId, 'public', 'data', 'drawings');
+    const publicPath = `/artifacts/${appId}/public/data/drawings`;
+    return collection(db, publicPath);
 }
+
+// Re-export constants for consistency (used in app/page.tsx for the public path)
+export const DRAWING_DOC_ID = 'master_whiteboard_lines';
