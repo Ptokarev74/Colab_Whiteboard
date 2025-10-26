@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { onSnapshot, setDoc, doc, updateDoc, getDoc, Firestore } from 'firebase/firestore';
+import { onSnapshot, setDoc, doc, getDoc, Firestore } from 'firebase/firestore';
 import { initializeFirebase, getDrawingCollection, DRAWING_DOC_ID } from '../src/utils/firebase';
 import { Paintbrush, Eraser, Loader2, RefreshCw } from 'lucide-react';
 
@@ -48,8 +48,8 @@ export default function Whiteboard() {
   const [db, setDb] = useState<Firestore | null>(null);
   const [userId, setUserId] = useState<string>('Initializing...');
   const [appId, setAppId] = useState<string>('default-app-id');
-  const [isAuthReady, setIsAuthReady] = useState(false);
-  const stateRef = useRef(state); // Ref to hold the latest state for event handlers
+  const [isContentReady, setIsContentReady] = useState(false); // Renamed flag
+  const stateRef = useRef(state);
 
   // Update stateRef whenever state changes
   useEffect(() => {
@@ -59,7 +59,7 @@ export default function Whiteboard() {
   // --- LOCAL PERSISTENCE HOOK (FOR OFFLINE DEV) ---
   const useLinesPersistence = (db: Firestore | null, lines: Line[], userId: string) => {
     useEffect(() => {
-      // Only runs if we are offline (db is null, as set in the fixed firebase.ts)
+      // Only runs if we are offline (db is null)
       if (db === null) {
         try {
           // Load from localStorage on initial render
@@ -87,7 +87,7 @@ export default function Whiteboard() {
 
   useLinesPersistence(db, state.lines, userId);
 
-  // --- FIREBASE INITIALIZATION AND REAL-TIME SYNC ---
+  // --- FIREBASE INITIALIZATION ---
 
   const setupFirebase = useCallback(async () => {
     try {
@@ -95,10 +95,8 @@ export default function Whiteboard() {
       setDb(db);
       setUserId(newUserId);
       setAppId(newAppId);
-      setIsAuthReady(true);
     } catch (e) {
       console.error("Failed to initialize Firebase:", e);
-      setIsAuthReady(false);
       setUserId("Error");
     }
   }, []);
@@ -108,34 +106,57 @@ export default function Whiteboard() {
   }, [setupFirebase]);
 
 
-  // Real-time Listener (onSnapshot)
+  // --- REAL-TIME LISTENER (THE CRITICAL SYNC FIX) ---
   useEffect(() => {
-    if (!isAuthReady || !db || !appId) return;
+    if (!db || !appId) return;
 
     const canvasCollection = getDrawingCollection(db, appId);
     if (!canvasCollection) return;
 
     const docRef = doc(canvasCollection, DRAWING_DOC_ID);
 
-    const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
-        if (docSnapshot.exists()) {
-            const data = docSnapshot.data();
-            const fetchedLinesString = data?.lines || '[]'; // Default to empty array string
-            
-            try {
-                // Parse the JSON string retrieved from Firestore
+    // 1. Fetch the initial state ONCE before attaching the listener (FETCH-FIRST)
+    const initializeDataAndListener = async () => {
+        try {
+            const docSnapshot = await getDoc(docRef);
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                const fetchedLinesString = data?.lines || '[]';
                 const parsedLines: Line[] = JSON.parse(fetchedLinesString);
                 setState(prevState => ({ ...prevState, lines: parsedLines }));
-            } catch (e) {
-                console.error("Failed to parse Firestore data:", e);
             }
+        } catch (error) {
+            console.error("Initial data fetch failed:", error);
         }
-    }, (error) => {
-        console.error("Firestore subscription error:", error);
-    });
+        
+        // 2. Once data is loaded, attach the continuous listener
+        const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                const fetchedLinesString = data?.lines || '[]';
+                
+                try {
+                    const parsedLines: Line[] = JSON.parse(fetchedLinesString);
+                    setState(prevState => ({ ...prevState, lines: parsedLines }));
+                } catch (e) {
+                    console.error("Failed to parse Firestore data in snapshot:", e);
+                }
+            }
+        }, (error) => {
+            console.error("Firestore subscription error:", error);
+        });
 
-    return () => unsubscribe();
-  }, [isAuthReady, db, appId]); 
+        // 3. Mark content as ready after successful setup
+        setIsContentReady(true);
+        return unsubscribe;
+    };
+
+    const cleanupPromise = initializeDataAndListener();
+
+    return () => {
+      cleanupPromise.then(unsubscribe => unsubscribe && unsubscribe());
+    };
+  }, [db, appId]); 
 
 
   // --- CANVAS & DRAWING HANDLERS ---
@@ -216,7 +237,7 @@ export default function Whiteboard() {
   }, []);
 
   const handleStartDrawing = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    if (!isAuthReady) return; 
+    if (!isContentReady) return; 
     
     e.preventDefault(); 
     
@@ -241,7 +262,7 @@ export default function Whiteboard() {
         const newLines = [...prevState.lines, dotLine];
         return { ...prevState, lines: newLines };
     });
-  }, [isAuthReady, getCanvasPoint]);
+  }, [isContentReady, getCanvasPoint]);
 
   const draw = useCallback((e: MouseEvent | TouchEvent) => {
     if (!isDrawing || !lastPoint.current || !canvasRef.current || !ctxRef.current) return;
@@ -275,6 +296,7 @@ const handleEndDrawing = useCallback(() => {
         lastPoint.current = null;
         
         // CRITICAL FIX: Only save the entire state when drawing STOPS
+        // This ensures one tab doesn't overwrite another during continuous drawing
         saveLinesToFirestore(stateRef.current.lines);
     }
 }, [isDrawing, saveLinesToFirestore]);
@@ -323,7 +345,7 @@ const handleEndDrawing = useCallback(() => {
   
   const CurrentToolIcon = state.currentTool === 'pen' ? Paintbrush : Eraser;
   
-  if (!isAuthReady) {
+  if (!isContentReady) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50">
         <Loader2 className="h-8 w-8 text-indigo-500 animate-spin" />
