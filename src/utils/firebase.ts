@@ -5,6 +5,7 @@ import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth
 import { getFirestore, collection, doc, Firestore } from 'firebase/firestore';
 
 // Global access to the environment variables set by the platform
+// These declarations are needed for TypeScript consistency
 declare const __firebase_config: string | undefined;
 declare const __initial_auth_token: string | undefined;
 declare const __app_id: string | undefined;
@@ -16,7 +17,7 @@ let userId: string | undefined = undefined;
 
 /**
  * Initializes Firebase App, performs user authentication, and sets up Firestore.
- * Includes robust checks for environments where global variables are undefined.
+ * This function is resilient against missing local/global variables.
  */
 export async function initializeFirebase(): Promise<{ db: Firestore | null, userId: string, appId: string }> {
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
@@ -26,8 +27,13 @@ export async function initializeFirebase(): Promise<{ db: Firestore | null, user
     }
 
     try {
-        // Check for existence before accessing; fall back to an empty object string for JSON.parse safety
-        const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        // --- CRITICAL FIX: Prioritize reading Vercel environment variable ---
+        const globalConfig = typeof __firebase_config !== 'undefined' ? __firebase_config : undefined;
+        const vercelConfig = typeof process.env.NEXT_PUBLIC_FIREBASE_CONFIG !== 'undefined' ? process.env.NEXT_PUBLIC_FIREBASE_CONFIG : undefined;
+
+        // Use global config (if present), then Vercel config, otherwise fallback to empty object string
+        const configString = globalConfig || vercelConfig || '{}';
+        
         const firebaseConfig = JSON.parse(configString);
 
         // We only proceed if firebaseConfig has actual keys (meaning it's a valid config)
@@ -43,6 +49,7 @@ export async function initializeFirebase(): Promise<{ db: Firestore | null, user
             if (initialAuthToken) {
                 await signInWithCustomToken(auth, initialAuthToken);
             } else {
+                // This is the path taken on Vercel/local
                 await signInAnonymously(auth);
             }
 
