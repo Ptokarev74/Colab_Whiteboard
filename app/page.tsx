@@ -320,7 +320,7 @@ export default function Whiteboard() {
 
   // --- RENDER ---
   
-  const currentToolIcon = state.currentTool === 'pen' ? Paintbrush : Eraser;
+  const CurrentToolIcon = state.currentTool === 'pen' ? Paintbrush : Eraser;
   
   if (!isAuthReady) {
     return (
@@ -383,7 +383,7 @@ export default function Whiteboard() {
 
             {/* Size Slider */}
             <div className="flex items-center bg-gray-200 rounded-full p-2 space-x-2">
-              <currentToolIcon className="h-5 w-5 text-gray-600" />
+              <CurrentToolIcon className="h-5 w-5 text-gray-600" />
               <input
                 type="range"
                 min="1"
