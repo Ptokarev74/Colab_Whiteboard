@@ -1,8 +1,12 @@
-'use client'; 
+'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { onSnapshot, setDoc, doc, getDoc, Firestore } from 'firebase/firestore';
+import { initializeFirebase, getDrawingCollection, DRAWING_DOC_ID } from '../src/utils/firebase';
+import { Paintbrush, Eraser, Loader2, RefreshCw } from 'lucide-react';
 
-// --- TYPE DEFINITIONS (Interfaces) ---
+// --- TYPESCRIPT INTERFACES ---
+
 interface Point {
   x: number;
   y: number;
@@ -13,6 +17,7 @@ interface Line {
   end: Point;
   color: string;
   size: number;
+  tool: 'pen' | 'eraser';
 }
 
 interface DrawingState {
@@ -29,161 +34,275 @@ const INITIAL_STATE: DrawingState = {
   currentSize: 5,
 };
 
+// --- CORE COMPONENT ---
 
-// --- MAIN WHITEBOARD COMPONENT LOGIC ---
-export default function Home() {
-  
-  // STATE & REFS
+export default function Whiteboard() {
+  // --- STATE AND REFS ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [state, setState] = useState<DrawingState>(INITIAL_STATE);
   const lastPoint = useRef<Point | null>(null);
 
-  const { lines, currentTool, currentColor, currentSize } = state;
+  // Firestore Refs
+  const [db, setDb] = useState<Firestore | null>(null);
+  const [userId, setUserId] = useState<string>('Initializing...');
+  const [appId, setAppId] = useState<string>('default-app-id');
+  const [isContentReady, setIsContentReady] = useState(false); // Renamed flag
+  const stateRef = useRef(state);
 
-  // --- UTILITY FUNCTIONS ---
+  // Update stateRef whenever state changes
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
-  const getContext = useCallback(() => {
-    return canvasRef.current?.getContext('2d');
+  // --- LOCAL PERSISTENCE HOOK (FOR OFFLINE DEV) ---
+  const useLinesPersistence = (db: Firestore | null, lines: Line[], userId: string) => {
+    useEffect(() => {
+      // Only runs if we are offline (db is null)
+      if (db === null) {
+        try {
+          // Load from localStorage on initial render
+          const storedLines = localStorage.getItem(`whiteboard_lines_${userId}`);
+          if (storedLines) {
+            setState(prevState => ({ ...prevState, lines: JSON.parse(storedLines) }));
+          }
+        } catch (e) {
+          console.warn("Could not load from local storage:", e);
+        }
+      }
+    }, [db, userId]);
+
+    // Save to localStorage whenever lines change AND we are offline
+    useEffect(() => {
+      if (db === null) {
+        try {
+          localStorage.setItem(`whiteboard_lines_${userId}`, JSON.stringify(lines));
+        } catch (e) {
+          console.warn("Could not save to local storage:", e);
+        }
+      }
+    }, [db, lines, userId]);
+  };
+
+  useLinesPersistence(db, state.lines, userId);
+
+  // --- FIREBASE INITIALIZATION ---
+
+  const setupFirebase = useCallback(async () => {
+    try {
+      const { db, userId: newUserId, appId: newAppId } = await initializeFirebase();
+      setDb(db);
+      setUserId(newUserId);
+      setAppId(newAppId);
+    } catch (e) {
+      console.error("Failed to initialize Firebase:", e);
+      setUserId("Error");
+    }
   }, []);
 
-  const redrawCanvas = useCallback((currentLines = lines) => {
+  useEffect(() => {
+    setupFirebase();
+  }, [setupFirebase]);
+
+
+  // --- REAL-TIME LISTENER (THE CRITICAL SYNC FIX) ---
+  useEffect(() => {
+    if (!db || !appId) return;
+
+    const canvasCollection = getDrawingCollection(db, appId);
+    if (!canvasCollection) return;
+
+    const docRef = doc(canvasCollection, DRAWING_DOC_ID);
+
+    // 1. Fetch the initial state ONCE before attaching the listener (FETCH-FIRST)
+    const initializeDataAndListener = async () => {
+        try {
+            const docSnapshot = await getDoc(docRef);
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                const fetchedLinesString = data?.lines || '[]';
+                const parsedLines: Line[] = JSON.parse(fetchedLinesString);
+                setState(prevState => ({ ...prevState, lines: parsedLines }));
+            }
+        } catch (error) {
+            console.error("Initial data fetch failed:", error);
+        }
+        
+        // 2. Once data is loaded, attach the continuous listener
+        const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                const fetchedLinesString = data?.lines || '[]';
+                
+                try {
+                    const parsedLines: Line[] = JSON.parse(fetchedLinesString);
+                    setState(prevState => ({ ...prevState, lines: parsedLines }));
+                } catch (e) {
+                    console.error("Failed to parse Firestore data in snapshot:", e);
+                }
+            }
+        }, (error) => {
+            console.error("Firestore subscription error:", error);
+        });
+
+        // 3. Mark content as ready after successful setup
+        setIsContentReady(true);
+        return unsubscribe;
+    };
+
+    const cleanupPromise = initializeDataAndListener();
+
+    return () => {
+      cleanupPromise.then(unsubscribe => unsubscribe && unsubscribe());
+    };
+  }, [db, appId]); 
+
+
+  // --- CANVAS & DRAWING HANDLERS ---
+
+  const redrawCanvas = useCallback((linesToDraw: Line[]) => {
     const canvas = canvasRef.current;
-    const ctx = getContext();
+    const ctx = ctxRef.current;
     if (!canvas || !ctx) return;
 
-    // Clear the entire canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    // Draw all lines from the state
-    currentLines.forEach(line => {
+
+    linesToDraw.forEach(line => {
+      const strokeColor = line.tool === 'eraser' ? '#ffffff' : line.color;
+      
       ctx.beginPath();
       ctx.moveTo(line.start.x, line.start.y);
       ctx.lineTo(line.end.x, line.end.y);
-      ctx.strokeStyle = line.color;
+      ctx.strokeStyle = strokeColor;
       ctx.lineWidth = line.size;
       ctx.lineCap = 'round';
       ctx.stroke();
     });
-  }, [lines, getContext]);
-
-  // --- INTERACTION HANDLERS ---
-
-  const handleStartDrawing = useCallback((event: React.MouseEvent | React.TouchEvent) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    let clientX, clientY;
-    if ('touches' in event) {
-      clientX = event.touches[0].clientX;
-      clientY = event.touches[0].clientY;
-      event.preventDefault(); // Prevent scrolling on touch
-    } else {
-      clientX = event.clientX;
-      clientY = event.clientY;
-    }
-
-    const rect = canvas.getBoundingClientRect();
-    const point: Point = {
-      x: clientX - rect.left,
-      y: clientY - rect.top,
-    };
-    
-    lastPoint.current = point;
-    setIsDrawing(true);
   }, []);
 
-  const draw = useCallback((event: MouseEvent | TouchEvent) => {
-    if (!isDrawing) return;
-    const canvas = canvasRef.current;
-    const ctx = getContext();
-    const startPoint = lastPoint.current;
-    if (!canvas || !ctx || !startPoint) return;
 
-    let clientX, clientY;
-    if ('touches' in event) {
-        clientX = event.touches[0].clientX;
-        clientY = event.touches[0].clientY;
-        event.preventDefault();
-    } else {
-        clientX = event.clientX;
-        clientY = event.clientY;
-    }
-
-    const rect = canvas.getBoundingClientRect();
-    const endPoint: Point = {
-        x: clientX - rect.left,
-        y: clientY - rect.top,
-    };
-
-    // Determine the color and size based on the current tool
-    const color = currentTool === 'eraser' ? '#ffffff' : currentColor; // Use white for eraser
-    const size = currentTool === 'eraser' ? currentSize * 2 : currentSize; // Make eraser thicker
-
-    const newLine: Line = { start: startPoint, end: endPoint, color: color, size: size };
-
-    // Update state to include the new line segment
-    setState(prevState => {
-        const newLines = [...prevState.lines, newLine];
-        // Redraw immediately for responsiveness
-        redrawCanvas(newLines); 
-        return { ...prevState, lines: newLines };
-    });
-
-    lastPoint.current = endPoint;
-
-  }, [isDrawing, getContext, currentTool, currentColor, currentSize, redrawCanvas]);
-
-
-  const handleEndDrawing = useCallback(() => {
-    setIsDrawing(false);
-    lastPoint.current = null;
-  }, []);
-
-  // --- TOOLBAR HANDLERS ---
-  const setTool = (tool: 'pen' | 'eraser') => setState(prev => ({ ...prev, currentTool: tool }));
-  const setColor = (e: React.ChangeEvent<HTMLInputElement>) => setState(prev => ({ ...prev, currentColor: e.target.value }));
-  const setSize = (e: React.ChangeEvent<HTMLInputElement>) => setState(prev => ({ ...prev, currentSize: parseInt(e.target.value, 10) }));
-  const clearCanvas = () => {
-    setState(prev => ({ ...prev, lines: [] }));
-    redrawCanvas([]); // Immediate clear
-  };
-  
-  // --- LIFECYCLE (EFFECTS) ---
-
-  // 1. Setup Canvas Dimensions and Resize Observer
+  // Effect to handle canvas context, resizing, and redrawing when lines state changes
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
-    // Set initial size
-    const container = canvas.parentElement;
-    if (container) {
-      canvas.width = container.clientWidth;
-      canvas.height = container.clientHeight;
-    }
 
-    // Handle responsiveness on window resize
-    const observer = new ResizeObserver(() => {
-        if (container) {
-            canvas.width = container.clientWidth;
-            canvas.height = container.clientHeight;
-            redrawCanvas(); // Redraw content to fit new size
-        }
+    const ctx = canvas.getContext('2d');
+    ctxRef.current = ctx;
+
+    const resizeObserver = new ResizeObserver(() => {
+      const rect = canvas.parentElement!.getBoundingClientRect();
+      canvas.width = rect.width;
+      canvas.height = rect.height;
+      redrawCanvas(state.lines);
     });
 
-    if (container) {
-        observer.observe(container);
-    }
+    resizeObserver.observe(canvas.parentElement!);
+
+    redrawCanvas(state.lines);
 
     return () => {
-        if (container) {
-            observer.unobserve(container);
-        }
+      resizeObserver.unobserve(canvas.parentElement!);
     };
-  }, [redrawCanvas]); 
+  }, [state.lines, redrawCanvas]);
 
-  // 2. Global Event Listeners (important for smooth drawing outside the canvas bounds)
+  // Function to save the full array to Firestore
+  const saveLinesToFirestore = useCallback(async (linesToSave: Line[]) => {
+    if (!db || !appId) {
+        return; 
+    }
+
+    const canvasCollection = getDrawingCollection(db, appId);
+    if (!canvasCollection) return;
+
+    const docRef = doc(canvasCollection, DRAWING_DOC_ID);
+    
+    try {
+        const linesJsonString = JSON.stringify(linesToSave);
+
+        // We use setDoc to overwrite the complete state, ensuring data consistency
+        await setDoc(docRef, { lines: linesJsonString }, { merge: false }); 
+    } catch (e) {
+        console.error("Failed to save drawing to Firestore:", e);
+    }
+  }, [db, appId]);
+
+
+  const getCanvasPoint = useCallback((clientX: number, clientY: number): Point => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+    };
+  }, []);
+
+  const handleStartDrawing = useCallback((e: React.MouseEvent | React.TouchEvent) => {
+    if (!isContentReady) return; 
+    
+    e.preventDefault(); 
+    
+    const { currentTool, currentColor, currentSize } = stateRef.current;
+    
+    const clientX = (e as React.MouseEvent).clientX || (e as React.TouchEvent).touches[0].clientX;
+    const clientY = (e as React.MouseEvent).clientY || (e as React.TouchEvent).touches[0].clientY;
+
+    const point = getCanvasPoint(clientX, clientY);
+    lastPoint.current = point;
+    setIsDrawing(true);
+    
+    const dotLine: Line = { 
+        start: point, 
+        end: point, 
+        color: currentColor, 
+        size: currentSize, 
+        tool: currentTool 
+    };
+    
+    setState(prevState => {
+        const newLines = [...prevState.lines, dotLine];
+        return { ...prevState, lines: newLines };
+    });
+  }, [isContentReady, getCanvasPoint]);
+
+  const draw = useCallback((e: MouseEvent | TouchEvent) => {
+    if (!isDrawing || !lastPoint.current || !canvasRef.current || !ctxRef.current) return;
+    
+    const { currentTool, currentColor, currentSize } = stateRef.current;
+
+    const clientX = (e as MouseEvent).clientX || (e as TouchEvent).touches[0].clientX;
+    const clientY = (e as MouseEvent).clientY || (e as TouchEvent).touches[0].clientY;
+    
+    const newPoint = getCanvasPoint(clientX, clientY);
+
+    const newLine: Line = {
+      start: lastPoint.current,
+      end: newPoint,
+      color: currentColor,
+      size: currentSize,
+      tool: currentTool,
+    };
+    
+    // Update local state
+    setState(prevState => ({ ...prevState, lines: [...prevState.lines, newLine] }));
+    
+    lastPoint.current = newPoint;
+
+}, [isDrawing, getCanvasPoint]);
+
+
+const handleEndDrawing = useCallback(() => {
+    if (isDrawing) {
+        setIsDrawing(false);
+        lastPoint.current = null;
+        
+        // CRITICAL FIX: Only save the entire state when drawing STOPS
+        // This ensures one tab doesn't overwrite another during continuous drawing
+        saveLinesToFirestore(stateRef.current.lines);
+    }
+}, [isDrawing, saveLinesToFirestore]);
+
+
+  // Effect to attach global mouse and touch listeners
   useEffect(() => {
     document.addEventListener('mousemove', draw as (e: MouseEvent) => void);
     document.addEventListener('mouseup', handleEndDrawing);
@@ -199,86 +318,131 @@ export default function Home() {
   }, [draw, handleEndDrawing]);
 
 
+  // --- UTILITY HANDLERS ---
+
+  const handleClearBoard = useCallback(() => {
+    // Clear locally immediately
+    setState(prevState => ({ ...prevState, lines: [] }));
+    
+    // Write an empty lines array to Firestore to clear for everyone
+    saveLinesToFirestore([]);
+  }, [saveLinesToFirestore]);
+
+  const setTool = (tool: 'pen' | 'eraser') => {
+    setState(prevState => ({ ...prevState, currentTool: tool }));
+  };
+
+  const setColor = (color: string) => {
+    setState(prevState => ({ ...prevState, currentColor: color, currentTool: 'pen' }));
+  };
+
+  const setSize = (size: number) => {
+    setState(prevState => ({ ...prevState, currentSize: size }));
+  };
+
+
   // --- RENDER ---
+  
+  const CurrentToolIcon = state.currentTool === 'pen' ? Paintbrush : Eraser;
+  
+  if (!isContentReady) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50">
+        <Loader2 className="h-8 w-8 text-indigo-500 animate-spin" />
+        <p className="mt-4 text-gray-600">Connecting to real-time service...</p>
+        <p className="mt-2 text-sm text-gray-500">User ID: {userId}</p>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col h-screen w-screen bg-gray-50 dark:bg-gray-800">
+    <div className="flex flex-col h-screen w-full bg-gray-100">
       
-      {/* --- TOOLBAR --- */}
-      <header className="flex-shrink-0 bg-white dark:bg-gray-900 shadow-md p-3 md:p-4 border-b border-indigo-100/50">
-        <div className="flex flex-wrap gap-3 items-center justify-center max-w-7xl mx-auto">
-          
-          {/* Tool Selector */}
-          <div className="flex bg-gray-100 dark:bg-gray-700 p-1 rounded-lg shadow-inner">
-            <button 
+      {/* --- TOP TOOLBAR --- */}
+      <header className="flex-shrink-0 bg-white shadow-md p-3 border-b border-gray-200">
+        <div className="flex items-center justify-between max-w-7xl mx-auto">
+          <h1 className="text-2xl font-extrabold text-indigo-600">
+            Collab Whiteboard
+          </h1>
+
+          <div className="flex space-x-2 sm:space-x-4">
+            {/* Pen/Eraser Toggle */}
+            <button
               onClick={() => setTool('pen')}
-              className={`p-2 rounded-md transition-colors font-medium text-sm ${currentTool === 'pen' ? 'bg-indigo-500 text-white shadow-md' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'}`}
+              className={`p-3 rounded-full transition duration-150 ${
+                state.currentTool === 'pen' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-gray-200 text-gray-600 hover:bg-indigo-100'
+              }`}
               title="Pen Tool"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 18.07a4.5 4.5 0 01-1.897 1.13L6 20l1.123-4.187a4.5 4.5 0 011.13-1.897l8.243-8.243zm-8.62 8.62c.36.36.78.667 1.24.908l6.23-6.23a1.5 1.5 0 00-2.12-2.12l-6.23 6.23c.24.46.547.88 01.24z" />
-              </svg>
+              <Paintbrush className="h-5 w-5" />
             </button>
-            <button 
+            <button
               onClick={() => setTool('eraser')}
-              className={`ml-2 p-2 rounded-md transition-colors font-medium text-sm ${currentTool === 'eraser' ? 'bg-indigo-500 text-white shadow-md' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'}`}
+              className={`p-3 rounded-full transition duration-150 ${
+                state.currentTool === 'eraser' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-gray-200 text-gray-600 hover:bg-indigo-100'
+              }`}
               title="Eraser Tool"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H15.75a2.25 2.25 0 01-2.244-2.077L9.257 5.94c.346-.04.682-.11 1.022-.165m-4.788 0L4.256 19.673a2.25 2.25 0 002.244 2.077h.971a2.25 2.25 0 002.244-2.077L13.738 5.775c.346-.04.682-.11 1.022-.165" />
-              </svg>
+              <Eraser className="h-5 w-5" />
+            </button>
+            
+            {/* Color Picker (Only visible for Pen) */}
+            {state.currentTool === 'pen' && (
+                <div className="relative">
+                    <input
+                      type="color"
+                      value={state.currentColor}
+                      onChange={(e) => setColor(e.target.value)}
+                      className="h-11 w-11 rounded-full border-2 border-gray-300 cursor-pointer overflow-hidden opacity-0 absolute top-0 left-0"
+                      title="Select Color"
+                    />
+                    <div 
+                        className="h-11 w-11 rounded-full border-2 border-gray-300 shadow-inner pointer-events-none" 
+                        style={{ backgroundColor: state.currentColor }}
+                    />
+                </div>
+            )}
+
+
+            {/* Size Slider */}
+            <div className="flex items-center bg-gray-200 rounded-full p-2 space-x-2">
+              <CurrentToolIcon className="h-5 w-5 text-gray-600" />
+              <input
+                type="range"
+                min="1"
+                max="50"
+                value={state.currentSize}
+                onChange={(e) => setSize(parseInt(e.target.value))}
+                className="w-20 h-2 bg-indigo-200 rounded-lg appearance-none cursor-pointer range-lg"
+              />
+              <span className="text-sm font-semibold w-6 text-gray-700">{state.currentSize}</span>
+            </div>
+
+            {/* Clear Button */}
+            <button
+              onClick={handleClearBoard}
+              className="p-3 bg-red-500 text-white rounded-full hover:bg-red-600 transition duration-150 shadow-lg"
+              title="Clear Board for All"
+            >
+              <RefreshCw className="h-5 w-5" />
             </button>
           </div>
-
-          {/* Color Picker (only shown for Pen) */}
-          {currentTool === 'pen' && (
-            <div className="flex items-center gap-2">
-              <span className="text-gray-600 dark:text-gray-300 text-sm font-medium">Color:</span>
-              <input 
-                type="color" 
-                value={currentColor}
-                onChange={setColor}
-                className="w-8 h-8 rounded-full border-none cursor-pointer p-0"
-                title="Line Color"
-              />
-            </div>
-          )}
-
-          {/* Line Size Selector */}
-          <div className="flex items-center gap-2">
-            <span className="text-gray-600 dark:text-gray-300 text-sm font-medium">Size: {currentSize}px</span>
-            <input 
-              type="range" 
-              min="1" 
-              max="50" 
-              value={currentSize} 
-              onChange={setSize}
-              className="w-24 h-2 rounded-lg appearance-none cursor-pointer bg-indigo-200 dark:bg-indigo-700"
-              title="Line Size"
-            />
+          
+          <div className="hidden sm:block text-xs font-mono text-gray-500 bg-gray-100 p-2 rounded-lg">
+            User ID: **{userId}**
           </div>
-
-          {/* Clear Button */}
-          <button
-            onClick={clearCanvas}
-            className="px-4 py-2 bg-red-500 text-white rounded-lg shadow-md hover:bg-red-600 transition duration-150 font-medium text-sm"
-            title="Clear All Drawings"
-          >
-            Clear All
-          </button>
         </div>
       </header>
-
+      
       {/* --- CANVAS AREA --- */}
-      <main className="flex-grow w-full max-w-7xl mx-auto p-4 md:p-6">
-        <div className="h-full bg-white dark:bg-gray-700 rounded-xl shadow-2xl overflow-hidden border-4 border-indigo-500/50">
+      <main className="flex-grow flex justify-center items-center p-4">
+        <div className="flex-grow w-full max-w-7xl h-full relative rounded-xl shadow-2xl overflow-hidden border-4 border-indigo-500/50">
           <canvas
             ref={canvasRef}
-            // Attach primary handlers to the canvas
             onMouseDown={handleStartDrawing}
             onTouchStart={handleStartDrawing}
-            style={{ cursor: isDrawing ? 'crosshair' : 'default', touchAction: 'none' }}
-            // The canvas is set to block-level and takes full available space of its container
-            className="w-full h-full block"
+            style={{ touchAction: 'none', cursor: isDrawing ? 'crosshair' : 'default' }}
+            className="bg-white w-full h-full block"
           />
         </div>
       </main>
