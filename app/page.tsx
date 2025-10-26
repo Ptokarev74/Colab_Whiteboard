@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { onSnapshot, setDoc, doc, getDoc, Firestore } from 'firebase/firestore';
 import { initializeFirebase, getDrawingCollection, DRAWING_DOC_ID } from '../src/utils/firebase';
 import { Paintbrush, Eraser, Loader2, RefreshCw } from 'lucide-react';
@@ -16,8 +16,14 @@ interface Line {
   start: Point;
   end: Point;
   color: string;
-  size: number;
+  size: number; // Stroke size is stored in world coordinates
   tool: 'pen' | 'eraser';
+}
+
+interface Camera {
+  x: number; // horizontal pan offset (in screen pixels)
+  y: number; // vertical pan offset (in screen pixels)
+  zoom: number; // scale factor
 }
 
 interface DrawingState {
@@ -33,6 +39,8 @@ const INITIAL_STATE: DrawingState = {
   currentColor: '#000000',
   currentSize: 5,
 };
+const INITIAL_CAMERA: Camera = { x: 0, y: 0, zoom: 1 };
+
 
 // --- CORE COMPONENT ---
 
@@ -40,29 +48,34 @@ export default function Whiteboard() {
   // --- STATE AND REFS ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  
   const [isDrawing, setIsDrawing] = useState(false);
+  const [isPanning, setIsPanning] = useState(false); // New state for panning mode
+  
   const [state, setState] = useState<DrawingState>(INITIAL_STATE);
+  const [camera, setCamera] = useState<Camera>(INITIAL_CAMERA);
+  
   const lastPoint = useRef<Point | null>(null);
 
   // Firestore Refs
   const [db, setDb] = useState<Firestore | null>(null);
   const [userId, setUserId] = useState<string>('Initializing...');
   const [appId, setAppId] = useState<string>('default-app-id');
-  const [isContentReady, setIsContentReady] = useState(false); // Renamed flag
-  const stateRef = useRef(state);
+  const [isContentReady, setIsContentReady] = useState(false); 
+  
+  // Refs to hold the latest state for event handlers (CRITICAL for smooth drawing/panning)
+  const stateRef = useRef(state); 
+  const cameraRef = useRef(camera); 
 
-  // Update stateRef whenever state changes
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => { cameraRef.current = camera; }, [camera]);
+
 
   // --- LOCAL PERSISTENCE HOOK (FOR OFFLINE DEV) ---
   const useLinesPersistence = (db: Firestore | null, lines: Line[], userId: string) => {
     useEffect(() => {
-      // Only runs if we are offline (db is null)
       if (db === null) {
         try {
-          // Load from localStorage on initial render
           const storedLines = localStorage.getItem(`whiteboard_lines_${userId}`);
           if (storedLines) {
             setState(prevState => ({ ...prevState, lines: JSON.parse(storedLines) }));
@@ -73,7 +86,6 @@ export default function Whiteboard() {
       }
     }, [db, userId]);
 
-    // Save to localStorage whenever lines change AND we are offline
     useEffect(() => {
       if (db === null) {
         try {
@@ -106,7 +118,57 @@ export default function Whiteboard() {
   }, [setupFirebase]);
 
 
-  // --- REAL-TIME LISTENER (THE CRITICAL SYNC FIX) ---
+  // --- CANVAS COORDINATE CONVERSION (New Logic) ---
+
+  const getCanvasPoint = useCallback((clientX: number, clientY: number): Point => {
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    const { x: camX, y: camY, zoom } = cameraRef.current; // Use camera ref
+
+    // Convert Screen Pixel to World Coordinate
+    const worldX = (clientX - rect.left - camX) / zoom;
+    const worldY = (clientY - rect.top - camY) / zoom;
+    
+    return { x: worldX, y: worldY };
+  }, []); // cameraRef.current is used inside the function, no need to list as dep
+
+
+  // --- REDRAW LOGIC (Updated to use Camera) ---
+
+  const redrawCanvas = useCallback((linesToDraw: Line[]) => {
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) return;
+    
+    const { x: camX, y: camY, zoom } = cameraRef.current;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Apply global canvas transformation based on the camera state
+    ctx.save();
+    ctx.translate(camX, camY); // Apply pan
+    ctx.scale(zoom, zoom);     // Apply zoom
+
+    linesToDraw.forEach(line => {
+      const strokeColor = line.tool === 'eraser' ? '#ffffff' : line.color;
+      
+      ctx.beginPath();
+      // Drawing points are already in World Coordinates
+      ctx.moveTo(line.start.x, line.start.y); 
+      ctx.lineTo(line.end.x, line.end.y);
+      
+      // Line properties must be scaled inversely to keep size consistent on screen
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = line.size / zoom; 
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    });
+
+    ctx.restore();
+  }, []); // cameraRef.current is used inside the function, no need to list as dep
+
+
+  // --- FIREBASE REAL-TIME LISTENER (FETCH-FIRST FIX) ---
   useEffect(() => {
     if (!db || !appId) return;
 
@@ -115,9 +177,9 @@ export default function Whiteboard() {
 
     const docRef = doc(canvasCollection, DRAWING_DOC_ID);
 
-    // 1. Fetch the initial state ONCE before attaching the listener (FETCH-FIRST)
     const initializeDataAndListener = async () => {
         try {
+            // 1. Fetch the initial state ONCE
             const docSnapshot = await getDoc(docRef);
             if (docSnapshot.exists()) {
                 const data = docSnapshot.data();
@@ -126,10 +188,10 @@ export default function Whiteboard() {
                 setState(prevState => ({ ...prevState, lines: parsedLines }));
             }
         } catch (error) {
-            console.error("Initial data fetch failed:", error);
+            console.error("Initial data fetch failed (check rules/connection):", error);
         }
         
-        // 2. Once data is loaded, attach the continuous listener
+        // 2. Attach the continuous listener
         const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
             if (docSnapshot.exists()) {
                 const data = docSnapshot.data();
@@ -146,7 +208,7 @@ export default function Whiteboard() {
             console.error("Firestore subscription error:", error);
         });
 
-        // 3. Mark content as ready after successful setup
+        // 3. Mark content as ready
         setIsContentReady(true);
         return unsubscribe;
     };
@@ -159,30 +221,7 @@ export default function Whiteboard() {
   }, [db, appId]); 
 
 
-  // --- CANVAS & DRAWING HANDLERS ---
-
-  const redrawCanvas = useCallback((linesToDraw: Line[]) => {
-    const canvas = canvasRef.current;
-    const ctx = ctxRef.current;
-    if (!canvas || !ctx) return;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    linesToDraw.forEach(line => {
-      const strokeColor = line.tool === 'eraser' ? '#ffffff' : line.color;
-      
-      ctx.beginPath();
-      ctx.moveTo(line.start.x, line.start.y);
-      ctx.lineTo(line.end.x, line.end.y);
-      ctx.strokeStyle = strokeColor;
-      ctx.lineWidth = line.size;
-      ctx.lineCap = 'round';
-      ctx.stroke();
-    });
-  }, []);
-
-
-  // Effect to handle canvas context, resizing, and redrawing when lines state changes
+  // Effect to handle context, resizing, and redrawing
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -206,6 +245,7 @@ export default function Whiteboard() {
     };
   }, [state.lines, redrawCanvas]);
 
+
   // Function to save the full array to Firestore
   const saveLinesToFirestore = useCallback(async (linesToSave: Line[]) => {
     if (!db || !appId) {
@@ -219,8 +259,6 @@ export default function Whiteboard() {
     
     try {
         const linesJsonString = JSON.stringify(linesToSave);
-
-        // We use setDoc to overwrite the complete state, ensuring data consistency
         await setDoc(docRef, { lines: linesJsonString }, { merge: false }); 
     } catch (e) {
         console.error("Failed to save drawing to Firestore:", e);
@@ -228,25 +266,30 @@ export default function Whiteboard() {
   }, [db, appId]);
 
 
-  const getCanvasPoint = useCallback((clientX: number, clientY: number): Point => {
-    const rect = canvasRef.current!.getBoundingClientRect();
-    return {
-      x: clientX - rect.left,
-      y: clientY - rect.top,
-    };
-  }, []);
+  // --- PANNING HANDLERS ---
 
   const handleStartDrawing = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     if (!isContentReady) return; 
     
     e.preventDefault(); 
     
-    const { currentTool, currentColor, currentSize } = stateRef.current;
-    
     const clientX = (e as React.MouseEvent).clientX || (e as React.TouchEvent).touches[0].clientX;
     const clientY = (e as React.MouseEvent).clientY || (e as React.TouchEvent).touches[0].clientY;
+    
+    // Panning logic: Middle mouse button (button 1)
+    const isMiddleClick = (e as React.MouseEvent).button === 1;
 
-    const point = getCanvasPoint(clientX, clientY);
+    if (isMiddleClick) {
+        setIsPanning(true);
+        lastPoint.current = { x: clientX, y: clientY }; // Store screen coordinates for panning
+        return;
+    }
+    
+    // --- DRAWING START LOGIC ---
+    
+    const { currentTool, currentColor, currentSize } = stateRef.current;
+    
+    const point = getCanvasPoint(clientX, clientY); // Convert to World Coordinates
     lastPoint.current = point;
     setIsDrawing(true);
     
@@ -264,6 +307,30 @@ export default function Whiteboard() {
     });
   }, [isContentReady, getCanvasPoint]);
 
+  
+  const handlePanMove = useCallback((e: MouseEvent) => {
+    if (!isPanning || !lastPoint.current) return;
+    
+    // Calculate difference in screen coordinates
+    const dx = e.clientX - lastPoint.current.x;
+    const dy = e.clientY - lastPoint.current.y;
+
+    // Update camera state
+    setCamera(prevCam => {
+        const newCam = {
+            ...prevCam,
+            x: prevCam.x + dx,
+            y: prevCam.y + dy,
+        };
+        cameraRef.current = newCam; 
+        return newCam;
+    });
+
+    // Update lastPoint for the next frame
+    lastPoint.current = { x: e.clientX, y: e.clientY };
+  }, [isPanning]);
+
+
   const draw = useCallback((e: MouseEvent | TouchEvent) => {
     if (!isDrawing || !lastPoint.current || !canvasRef.current || !ctxRef.current) return;
     
@@ -272,7 +339,7 @@ export default function Whiteboard() {
     const clientX = (e as MouseEvent).clientX || (e as TouchEvent).touches[0].clientX;
     const clientY = (e as MouseEvent).clientY || (e as TouchEvent).touches[0].clientY;
     
-    const newPoint = getCanvasPoint(clientX, clientY);
+    const newPoint = getCanvasPoint(clientX, clientY); // Convert to World Coordinates
 
     const newLine: Line = {
       start: lastPoint.current,
@@ -287,35 +354,69 @@ export default function Whiteboard() {
     
     lastPoint.current = newPoint;
 
-}, [isDrawing, getCanvasPoint]);
+  }, [isDrawing, getCanvasPoint]);
 
 
-const handleEndDrawing = useCallback(() => {
+  const handleEndDrawing = useCallback(() => {
     if (isDrawing) {
         setIsDrawing(false);
         lastPoint.current = null;
-        
-        // CRITICAL FIX: Only save the entire state when drawing STOPS
-        // This ensures one tab doesn't overwrite another during continuous drawing
         saveLinesToFirestore(stateRef.current.lines);
     }
-}, [isDrawing, saveLinesToFirestore]);
+    if (isPanning) {
+        setIsPanning(false);
+        lastPoint.current = null;
+    }
+  }, [isDrawing, isPanning, saveLinesToFirestore]);
 
+
+  // --- ZOOM HANDLER ---
+
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const { zoom: oldZoom, x: oldX, y: oldY } = cameraRef.current;
+    
+    const zoomFactor = 1.1; // Zoom step
+    const newZoom = e.deltaY > 0 ? oldZoom / zoomFactor : oldZoom * zoomFactor;
+    
+    const clampedZoom = Math.max(0.1, Math.min(newZoom, 5)); // Zoom limits
+
+    // Mouse position relative to the canvas
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    // Calculate new position to keep the point under the mouse stable
+    const newX = mouseX - ((mouseX - oldX) / oldZoom) * clampedZoom;
+    const newY = mouseY - ((mouseY - oldY) / oldZoom) * clampedZoom;
+
+    setCamera({
+        x: newX,
+        y: newY,
+        zoom: clampedZoom,
+    });
+  }, []);
 
   // Effect to attach global mouse and touch listeners
   useEffect(() => {
+    // Drawing listeners
     document.addEventListener('mousemove', draw as (e: MouseEvent) => void);
+    
+    // Panning listeners
+    document.addEventListener('mousemove', handlePanMove);
+    
+    // End listeners (stops both drawing and panning)
     document.addEventListener('mouseup', handleEndDrawing);
-    document.addEventListener('touchmove', draw as (e: TouchEvent) => void);
     document.addEventListener('touchend', handleEndDrawing);
 
     return () => {
       document.removeEventListener('mousemove', draw as (e: MouseEvent) => void);
+      document.removeEventListener('mousemove', handlePanMove);
       document.removeEventListener('mouseup', handleEndDrawing);
-      document.removeEventListener('touchmove', draw as (e: TouchEvent) => void);
       document.removeEventListener('touchend', handleEndDrawing);
     };
-  }, [draw, handleEndDrawing]);
+  }, [draw, handleEndDrawing, handlePanMove]);
 
 
   // --- UTILITY HANDLERS ---
@@ -326,6 +427,7 @@ const handleEndDrawing = useCallback(() => {
     
     // Write an empty lines array to Firestore to clear for everyone
     saveLinesToFirestore([]);
+    setCamera(INITIAL_CAMERA); // Reset camera on clear
   }, [saveLinesToFirestore]);
 
   const setTool = (tool: 'pen' | 'eraser') => {
@@ -344,6 +446,7 @@ const handleEndDrawing = useCallback(() => {
   // --- RENDER ---
   
   const CurrentToolIcon = state.currentTool === 'pen' ? Paintbrush : Eraser;
+  const cursorStyle = isDrawing ? 'crosshair' : (isPanning ? 'grabbing' : 'default');
   
   if (!isContentReady) {
     return (
@@ -441,9 +544,18 @@ const handleEndDrawing = useCallback(() => {
             ref={canvasRef}
             onMouseDown={handleStartDrawing}
             onTouchStart={handleStartDrawing}
-            style={{ touchAction: 'none', cursor: isDrawing ? 'crosshair' : 'default' }}
+            onWheel={handleWheel}
+            // Use the combined cursor style
+            style={{ touchAction: 'none', cursor: cursorStyle }}
             className="bg-white w-full h-full block"
           />
+          {/* Zoom Indicator */}
+          <div className="absolute bottom-4 right-4 bg-gray-800 text-white text-xs px-3 py-1.5 rounded-full shadow-lg">
+            Zoom: {(camera.zoom * 100).toFixed(0)}%
+          </div>
+          <div className="absolute bottom-4 left-4 text-xs text-gray-500 bg-white px-3 py-1.5 rounded-full shadow-lg">
+            Pan: Middle-Click Drag
+          </div>
         </div>
       </main>
     </div>
