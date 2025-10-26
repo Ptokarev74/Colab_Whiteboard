@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { onSnapshot, setDoc, doc } from 'firebase/firestore';
+import { onSnapshot, setDoc, doc, updateDoc, getDoc, Firestore } from 'firebase/firestore';
 import { initializeFirebase, getDrawingCollection, DRAWING_DOC_ID } from '../src/utils/firebase';
 import { Paintbrush, Eraser, Loader2, RefreshCw } from 'lucide-react';
 
@@ -45,10 +45,10 @@ export default function Whiteboard() {
   const lastPoint = useRef<Point | null>(null);
 
   // Firestore Refs
-  const [db, setDb] = useState<any>(null);
+  const [db, setDb] = useState<Firestore | null>(null);
   const [userId, setUserId] = useState<string>('Initializing...');
+  const [appId, setAppId] = useState<string>('default-app-id');
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const lineToSaveRef = useRef<Line[]>([]); // Buffer for saving to Firestore
   const stateRef = useRef(state); // Ref to hold the latest state for event handlers
 
   // Update stateRef whenever state changes
@@ -56,13 +56,45 @@ export default function Whiteboard() {
     stateRef.current = state;
   }, [state]);
 
+  // --- LOCAL PERSISTENCE HOOK (FOR OFFLINE DEV) ---
+  const useLinesPersistence = (db: Firestore | null, lines: Line[], userId: string) => {
+    useEffect(() => {
+      // Only runs if we are offline (db is null, as set in the fixed firebase.ts)
+      if (db === null) {
+        try {
+          // Load from localStorage on initial render
+          const storedLines = localStorage.getItem(`whiteboard_lines_${userId}`);
+          if (storedLines) {
+            setState(prevState => ({ ...prevState, lines: JSON.parse(storedLines) }));
+          }
+        } catch (e) {
+          console.warn("Could not load from local storage:", e);
+        }
+      }
+    }, [db, userId]);
+
+    // Save to localStorage whenever lines change AND we are offline
+    useEffect(() => {
+      if (db === null) {
+        try {
+          localStorage.setItem(`whiteboard_lines_${userId}`, JSON.stringify(lines));
+        } catch (e) {
+          console.warn("Could not save to local storage:", e);
+        }
+      }
+    }, [db, lines, userId]);
+  };
+
+  useLinesPersistence(db, state.lines, userId);
+
   // --- FIREBASE INITIALIZATION AND REAL-TIME SYNC ---
 
   const setupFirebase = useCallback(async () => {
     try {
-      const { db, userId: newUserId } = await initializeFirebase();
+      const { db, userId: newUserId, appId: newAppId } = await initializeFirebase();
       setDb(db);
       setUserId(newUserId);
+      setAppId(newAppId);
       setIsAuthReady(true);
     } catch (e) {
       console.error("Failed to initialize Firebase:", e);
@@ -78,22 +110,21 @@ export default function Whiteboard() {
 
   // Real-time Listener (onSnapshot)
   useEffect(() => {
-    if (!isAuthReady || !db || !userId) return;
+    if (!isAuthReady || !db || !appId) return;
 
-    const canvasCollection = getDrawingCollection(db, userId);
+    const canvasCollection = getDrawingCollection(db, appId);
     if (!canvasCollection) return;
-    
-    // Listen to the master document
+
     const docRef = doc(canvasCollection, DRAWING_DOC_ID);
 
     const unsubscribe = onSnapshot(docRef, (docSnapshot) => {
         if (docSnapshot.exists()) {
             const data = docSnapshot.data();
-            const fetchedLines = data?.lines || [];
+            const fetchedLinesString = data?.lines || '[]'; // Default to empty array string
             
-            // Note: Data coming from Firestore is JSON and must be parsed
             try {
-                const parsedLines: Line[] = JSON.parse(fetchedLines) || [];
+                // Parse the JSON string retrieved from Firestore
+                const parsedLines: Line[] = JSON.parse(fetchedLinesString);
                 setState(prevState => ({ ...prevState, lines: parsedLines }));
             } catch (e) {
                 console.error("Failed to parse Firestore data:", e);
@@ -104,7 +135,7 @@ export default function Whiteboard() {
     });
 
     return () => unsubscribe();
-  }, [isAuthReady, db, userId]); // Re-run when db or userId changes
+  }, [isAuthReady, db, appId]); 
 
 
   // --- CANVAS & DRAWING HANDLERS ---
@@ -114,12 +145,9 @@ export default function Whiteboard() {
     const ctx = ctxRef.current;
     if (!canvas || !ctx) return;
 
-    // Clear the entire canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Iterate through every line segment and draw it
     linesToDraw.forEach(line => {
-      // Eraser is drawn by using the background color (usually white)
       const strokeColor = line.tool === 'eraser' ? '#ffffff' : line.color;
       
       ctx.beginPath();
@@ -141,10 +169,8 @@ export default function Whiteboard() {
     const ctx = canvas.getContext('2d');
     ctxRef.current = ctx;
 
-    // Resize Observer for responsive canvas
     const resizeObserver = new ResizeObserver(() => {
-      // Set the canvas resolution to its display size
-      const rect = canvas.getBoundingClientRect();
+      const rect = canvas.parentElement!.getBoundingClientRect();
       canvas.width = rect.width;
       canvas.height = rect.height;
       redrawCanvas(state.lines);
@@ -152,7 +178,6 @@ export default function Whiteboard() {
 
     resizeObserver.observe(canvas.parentElement!);
 
-    // Initial redraw
     redrawCanvas(state.lines);
 
     return () => {
@@ -160,26 +185,26 @@ export default function Whiteboard() {
     };
   }, [state.lines, redrawCanvas]);
 
-  // Function to save the buffered lines to Firestore
+  // Function to save the full array to Firestore
   const saveLinesToFirestore = useCallback(async (linesToSave: Line[]) => {
-    if (!db || !userId || linesToSave.length === 0) return;
+    if (!db || !appId) {
+        return; 
+    }
 
-    const canvasCollection = getDrawingCollection(db, userId);
+    const canvasCollection = getDrawingCollection(db, appId);
     if (!canvasCollection) return;
 
     const docRef = doc(canvasCollection, DRAWING_DOC_ID);
     
-    // We store the full array of lines as a JSON string to keep it within a single document field limit
     try {
         const linesJsonString = JSON.stringify(linesToSave);
 
-        await setDoc(docRef, { lines: linesJsonString }, { merge: false });
-        // Clear the buffer after successful save
-        lineToSaveRef.current = [];
+        // We use setDoc to overwrite the complete state, ensuring data consistency
+        await setDoc(docRef, { lines: linesJsonString }, { merge: false }); 
     } catch (e) {
         console.error("Failed to save drawing to Firestore:", e);
     }
-  }, [db, userId]);
+  }, [db, appId]);
 
 
   const getCanvasPoint = useCallback((clientX: number, clientY: number): Point => {
@@ -190,15 +215,12 @@ export default function Whiteboard() {
     };
   }, []);
 
-
   const handleStartDrawing = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    if (!isAuthReady) return; // Only allow drawing when Firebase is ready
-
-    // Use current state from ref
-    const { currentTool, currentColor, currentSize } = stateRef.current;
+    if (!isAuthReady) return; 
     
-    // Prevent scrolling on touch
     e.preventDefault(); 
+    
+    const { currentTool, currentColor, currentSize } = stateRef.current;
     
     const clientX = (e as React.MouseEvent).clientX || (e as React.TouchEvent).touches[0].clientX;
     const clientY = (e as React.MouseEvent).clientY || (e as React.TouchEvent).touches[0].clientY;
@@ -207,7 +229,6 @@ export default function Whiteboard() {
     lastPoint.current = point;
     setIsDrawing(true);
     
-    // Add the first point as a tiny dot line
     const dotLine: Line = { 
         start: point, 
         end: point, 
@@ -216,14 +237,11 @@ export default function Whiteboard() {
         tool: currentTool 
     };
     
-    // Update local state and the buffer
     setState(prevState => {
         const newLines = [...prevState.lines, dotLine];
-        lineToSaveRef.current = [...lineToSaveRef.current, dotLine];
         return { ...prevState, lines: newLines };
     });
   }, [isAuthReady, getCanvasPoint]);
-
 
   const draw = useCallback((e: MouseEvent | TouchEvent) => {
     if (!isDrawing || !lastPoint.current || !canvasRef.current || !ctxRef.current) return;
@@ -243,43 +261,29 @@ export default function Whiteboard() {
       tool: currentTool,
     };
     
-    // 1. Update local state with the new line segment
-    setState(prevState => {
-        const newLines = [...prevState.lines, newLine];
-        return { ...prevState, lines: newLines };
-    });
-
-    // 2. Add to the Firestore save buffer
-    lineToSaveRef.current = [...lineToSaveRef.current, newLine];
+    // Update local state
+    setState(prevState => ({ ...prevState, lines: [...prevState.lines, newLine] }));
     
-    // 3. Update the last point for the next segment
     lastPoint.current = newPoint;
-    
-    // 4. Periodically save the buffered lines to Firestore (e.g., every 10 points added)
-    if (lineToSaveRef.current.length > 10) {
-        // Save the entire current state array to maintain order and clear the buffer
-        saveLinesToFirestore(stateRef.current.lines);
-    }
-  }, [isDrawing, getCanvasPoint, saveLinesToFirestore]);
+
+}, [isDrawing, getCanvasPoint]);
 
 
-  const handleEndDrawing = useCallback(() => {
+const handleEndDrawing = useCallback(() => {
     if (isDrawing) {
         setIsDrawing(false);
         lastPoint.current = null;
-        // Final save after the drawing motion stops
+        
+        // CRITICAL FIX: Only save the entire state when drawing STOPS
         saveLinesToFirestore(stateRef.current.lines);
     }
-  }, [isDrawing, saveLinesToFirestore]);
+}, [isDrawing, saveLinesToFirestore]);
 
 
   // Effect to attach global mouse and touch listeners
   useEffect(() => {
-    // Attach mouse listeners to the document for continuity outside the canvas
     document.addEventListener('mousemove', draw as (e: MouseEvent) => void);
     document.addEventListener('mouseup', handleEndDrawing);
-    
-    // Attach touch listeners for mobile
     document.addEventListener('touchmove', draw as (e: TouchEvent) => void);
     document.addEventListener('touchend', handleEndDrawing);
 
@@ -295,22 +299,19 @@ export default function Whiteboard() {
   // --- UTILITY HANDLERS ---
 
   const handleClearBoard = useCallback(() => {
-    if (!db || !userId) return;
-
-    // Locally clear state immediately
+    // Clear locally immediately
     setState(prevState => ({ ...prevState, lines: [] }));
     
     // Write an empty lines array to Firestore to clear for everyone
     saveLinesToFirestore([]);
-  }, [db, userId, saveLinesToFirestore]);
+  }, [saveLinesToFirestore]);
 
   const setTool = (tool: 'pen' | 'eraser') => {
     setState(prevState => ({ ...prevState, currentTool: tool }));
   };
 
   const setColor = (color: string) => {
-    setState(prevState => ({ ...prevState, currentColor: color }));
-    setTool('pen'); // Switch to pen when color is selected
+    setState(prevState => ({ ...prevState, currentColor: color, currentTool: 'pen' }));
   };
 
   const setSize = (size: number) => {
@@ -416,10 +417,8 @@ export default function Whiteboard() {
         <div className="flex-grow w-full max-w-7xl h-full relative rounded-xl shadow-2xl overflow-hidden border-4 border-indigo-500/50">
           <canvas
             ref={canvasRef}
-            // Attach primary listeners to the canvas area
             onMouseDown={handleStartDrawing}
             onTouchStart={handleStartDrawing}
-            // Prevents native scrolling when touching the canvas on mobile
             style={{ touchAction: 'none', cursor: isDrawing ? 'crosshair' : 'default' }}
             className="bg-white w-full h-full block"
           />
